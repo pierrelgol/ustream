@@ -3,6 +3,7 @@ const Io = std.Io;
 const Packetizer = @import("Packetizer.zig");
 const net = std.Io.net;
 const log = std.log;
+const mem = std.mem;
 
 pub const Server = struct {
     socket: net.Socket,
@@ -218,19 +219,92 @@ pub const Server = struct {
     }
 };
 
-pub fn generateSdpFile(file_path: []const u8) !void {
+pub const SpsPps = struct {
+    sps: []const u8,
+    pps: []const u8,
+};
+
+pub fn findSpsPps(data: []const u8) ?SpsPps {
+    var i: usize = 0;
+    var sps: ?[]const u8 = null;
+    var pps: ?[]const u8 = null;
+
+    while (i + 3 < data.len) {
+        const start_len = startCodeLen(data, i) orelse {
+            i += 1;
+            continue;
+        };
+
+        const nal_start = i + start_len;
+        var j: usize = nal_start;
+        while (j + 3 < data.len and startCodeLen(data, j) == null) : (j += 1) {}
+        if (j + 3 >= data.len) j = data.len;
+
+        const nal = data[nal_start..j];
+        if (nal.len > 0) {
+            const nal_type = nal[0] & 0x1F;
+            if (nal_type == 7 and sps == null) sps = nal;
+            if (nal_type == 8 and pps == null) pps = nal;
+            if (sps != null and pps != null) break;
+        }
+
+        i = j;
+    }
+
+    if (sps == null or pps == null) return null;
+    return .{ .sps = sps.?, .pps = pps.? };
+}
+
+fn startCodeLen(data: []const u8, index: usize) ?usize {
+    if (index + 4 <= data.len and mem.eql(u8, data[index .. index + 4], "\x00\x00\x00\x01")) {
+        return 4;
+    }
+    if (index + 3 <= data.len and mem.eql(u8, data[index .. index + 3], "\x00\x00\x01")) {
+        return 3;
+    }
+    return null;
+}
+
+pub fn generateSdpFile(
+    file_path: []const u8,
+    host: []const u8,
+    port: u16,
+    sps_pps: ?SpsPps,
+) !void {
     log.debug("[Pipeline] Generating SDP file: {s}", .{file_path});
 
-    const sdp_content =
-        \\v=0
-        \\o=- 0 0 IN IP4 127.0.0.1
-        \\s=H264 RTP stream
-        \\c=IN IP4 127.0.0.1
-        \\t=0 0
-        \\m=video 5004 RTP/AVP 96
-        \\a=rtpmap:96 H264/90000
-        \\
-    ;
+    var fmtp_line: []const u8 = "";
+    var fmtp_buf: [1024]u8 = undefined;
+    if (sps_pps) |params| {
+        const sps_b64_len = std.base64.standard.Encoder.calcSize(params.sps.len);
+        const pps_b64_len = std.base64.standard.Encoder.calcSize(params.pps.len);
+        const sps_b64 = try std.heap.page_allocator.alloc(u8, sps_b64_len);
+        defer std.heap.page_allocator.free(sps_b64);
+        const pps_b64 = try std.heap.page_allocator.alloc(u8, pps_b64_len);
+        defer std.heap.page_allocator.free(pps_b64);
+
+        const sps_slice = std.base64.standard.Encoder.encode(sps_b64, params.sps);
+        const pps_slice = std.base64.standard.Encoder.encode(pps_b64, params.pps);
+        fmtp_line = try std.fmt.bufPrint(
+            &fmtp_buf,
+            "a=fmtp:96 packetization-mode=1; sprop-parameter-sets={s},{s}\n",
+            .{ sps_slice, pps_slice },
+        );
+    }
+
+    const sdp_content = try std.fmt.allocPrint(
+        std.heap.page_allocator,
+        "v=0\n" ++
+            "o=- 0 0 IN IP4 {s}\n" ++
+            "s=H264 RTP stream\n" ++
+            "c=IN IP4 {s}\n" ++
+            "t=0 0\n" ++
+            "m=video {d} RTP/AVP 96\n" ++
+            "a=rtpmap:96 H264/90000\n" ++
+            "{s}\n",
+        .{ host, host, port, fmtp_line },
+    );
+    defer std.heap.page_allocator.free(sdp_content);
 
     const file = try std.fs.cwd().createFile(file_path, .{});
     defer file.close();

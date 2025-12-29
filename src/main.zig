@@ -76,6 +76,24 @@ pub fn main() !void {
     };
     defer process.argsFree(gpa.allocator(), argv);
 
+    if (argv.len < 2) {
+        return log.err("Usage: {s} <input.h264> [fps]", .{argv[0]});
+    }
+
+    const fps: u32 = if (argv.len > 2)
+        std.fmt.parseInt(u32, argv[2], 10) catch |err| {
+            return log.err("Fatal: invalid fps '{s}': {s}", .{ argv[2], @errorName(err) });
+        }
+    else
+        30;
+    if (fps == 0) {
+        return log.err("Fatal: fps must be > 0", .{});
+    }
+    const timestamp_step: u32 = 90000 / fps;
+    if (timestamp_step == 0) {
+        return log.err("Fatal: fps too high for 90kHz clock", .{});
+    }
+
     const cwd = std.Io.Dir.cwd();
     const file = cwd.openFile(threaded.io(), argv[1], .{ .mode = .read_only }) catch |err| {
         return log.err("Fatal : {}", .{err});
@@ -94,10 +112,12 @@ pub fn main() !void {
 
     var pak_buffer: [1024]Packetizer.RtpPacket = undefined;
     var pak_queue: Io.Queue(Packetizer.RtpPacket) = .init(&pak_buffer);
-    var packetizer = Packetizer.Packetizer.init(&nal_queue, 421412, 1000);
+    var packetizer = Packetizer.Packetizer.init(&nal_queue, 421412, 1000, timestamp_step);
 
     // Initialize UDP RTP Server
     var server_file_buffer: [256 * 1024]u8 = undefined;
+    const dest_host = "127.0.0.1";
+    const dest_port: u16 = 5004;
     const dest_addr = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:5004");
 
     var server = try Server.Server.init(
@@ -110,7 +130,14 @@ pub fn main() !void {
     defer server.deinit(threaded.io());
 
     // Generate SDP file for VLC
-    try Server.generateSdpFile("session.sdp");
+    const sdp_data = try std.fs.cwd().readFileAlloc(
+        argv[1],
+        gpa.allocator(),
+        std.Io.Limit.limited(64 * 1024 * 1024),
+    );
+    defer gpa.allocator().free(sdp_data);
+    const sps_pps = Server.findSpsPps(sdp_data);
+    try Server.generateSdpFile("session.sdp", dest_host, dest_port, sps_pps);
 
     log.debug("[Pipeline] Launching 4-stage concurrent pipeline", .{});
     log.debug("[Pipeline] - Stage 1: NAL Producer (H.264 parser)", .{});

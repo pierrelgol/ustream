@@ -13,32 +13,23 @@ pub const Packetizer = struct { // need to find a better name this sucks
     sequence_number: u16,
     timestamp: u32,
     ssrc: u32,
+    timestamp_step: u32,
     current_nal: ?h264.Nal,
     fragment_offset: u32,
     mtu: u32,
     max_payload_size: u32,
-    // SPS/PPS caching for periodic resending
-    cached_sps: ?h264.Nal,
-    cached_pps: ?h264.Nal,
-    pending_sps: bool,
-    pending_pps: bool,
-    packets_since_sps_pps: u32,
 
-    pub fn init(source: *Io.Queue(h264.Nal), ssrc: u32, mtu: u32) Packetizer {
+    pub fn init(source: *Io.Queue(h264.Nal), ssrc: u32, mtu: u32, timestamp_step: u32) Packetizer {
         return .{
             .source = source,
             .sequence_number = 0,
             .timestamp = 0,
             .ssrc = ssrc,
+            .timestamp_step = timestamp_step,
             .current_nal = null,
             .fragment_offset = 0,
             .mtu = mtu,
             .max_payload_size = mtu - RTP_HEADER_SIZE,
-            .cached_sps = null,
-            .cached_pps = null,
-            .pending_sps = false,
-            .pending_pps = false,
-            .packets_since_sps_pps = 0,
         };
     }
 
@@ -46,47 +37,10 @@ pub const Packetizer = struct { // need to find a better name this sucks
         return nal.size() > self.max_payload_size;
     }
 
-    fn incrementTimestamp(self: *Packetizer, delta: u32) void {
-        self.timestamp +%= delta;
-    }
-
     pub fn next(self: *Packetizer, io: Io) !?RtpPacket {
         // If we're currently fragmenting a NAL, return the next fragments
         if (self.current_nal) |_| {
             return self.createFragment();
-        }
-
-        // If we have pending SPS/PPS to resend, send them first
-        if (self.pending_sps) {
-            self.pending_sps = false;
-            if (self.cached_sps) |sps| {
-                std.log.debug("[Stage 2: Packetizer] Resending SPS", .{});
-                self.incrementTimestamp(3000);
-                self.packets_since_sps_pps = 0; // Reset counter
-                if (self.isFragmentationNeeded(sps)) {
-                    self.current_nal = sps;
-                    self.fragment_offset = 0;
-                    return self.createFragment();
-                } else {
-                    return self.createSinglePacket(sps);
-                }
-            }
-        }
-
-        if (self.pending_pps) {
-            self.pending_pps = false;
-            if (self.cached_pps) |pps| {
-                std.log.debug("[Stage 2: Packetizer] Resending PPS", .{});
-                self.incrementTimestamp(3000);
-                self.packets_since_sps_pps = 0; // Reset counter
-                if (self.isFragmentationNeeded(pps)) {
-                    self.current_nal = pps;
-                    self.fragment_offset = 0;
-                    return self.createFragment();
-                } else {
-                    return self.createSinglePacket(pps);
-                }
-            }
         }
 
         // Otherwise, get the next NAL from the queue
@@ -98,47 +52,9 @@ pub const Packetizer = struct { // need to find a better name this sucks
         // Log NAL type for debugging
         std.log.debug("[Stage 2: Packetizer] Processing NAL type={s} size={d}", .{ @tagName(nal.header.kind), nal.size() });
 
-        // Cache SPS/PPS for periodic resending
-        switch (nal.header.kind) {
-            .sps => {
-                std.log.debug("[Stage 2: Packetizer] Caching SPS", .{});
-                self.cached_sps = nal;
-                // Don't reset counter - SPS/PPS in stream don't count as resends
-            },
-            .pps => {
-                std.log.debug("[Stage 2: Packetizer] Caching PPS", .{});
-                self.cached_pps = nal;
-                // Don't reset counter - SPS/PPS in stream don't count as resends
-            },
-            .slice_idr => {
-                // Before sending IDR, schedule SPS/PPS resend
-                std.log.debug("[Stage 2: Packetizer] IDR detected - scheduling SPS/PPS resend", .{});
-                self.pending_sps = self.cached_sps != null;
-                self.pending_pps = self.cached_pps != null;
-
-                // If we have cached SPS/PPS, return them first (recursively)
-                if (self.pending_sps or self.pending_pps) {
-                    return self.next(io);
-                }
-            },
-            else => {},
+        if (isVclNal(nal.header.kind)) {
+            self.timestamp +%= self.timestamp_step;
         }
-
-        // Periodically resend SPS/PPS every 100 NALs (for late joiners like FFmpeg)
-        self.packets_since_sps_pps += 1;
-        if (self.packets_since_sps_pps >= 100) {
-            std.log.debug("[Stage 2: Packetizer] Periodic SPS/PPS resend (every 100 NALs)", .{});
-            self.pending_sps = self.cached_sps != null;
-            self.pending_pps = self.cached_pps != null;
-
-            // If we have cached SPS/PPS, return them first (recursively)
-            if (self.pending_sps or self.pending_pps) {
-                return self.next(io);
-            }
-        }
-
-        // Increment timestamp for new NAL
-        self.incrementTimestamp(3000); // TODO : need to refine this logic, it's not really correct
 
         if (self.isFragmentationNeeded(nal)) {
             self.current_nal = nal;
@@ -150,12 +66,13 @@ pub const Packetizer = struct { // need to find a better name this sucks
     }
 
     fn createSinglePacket(self: *Packetizer, nal: h264.Nal) RtpPacket {
+        const is_vcl = isVclNal(nal.header.kind);
         const header = RtpHeader{
             .version = 2,
             .padding = 0,
             .extension = 0,
             .csrc_count = 0,
-            .marker = 1, // TODO : make it better no idea right now
+            .marker = if (is_vcl) 1 else 0,
             .payload_type = .h264,
             .sequence_number = self.sequence_number,
             .timestamp = self.timestamp,
@@ -196,12 +113,13 @@ pub const Packetizer = struct { // need to find a better name this sucks
             .original_nal_type = nal.header.kind,
         };
 
+        const is_vcl = isVclNal(nal.header.kind);
         const rtp_header = RtpHeader{
             .version = 2,
             .padding = 0,
             .extension = 0,
             .csrc_count = 0,
-            .marker = if (is_last) 1 else 0,
+            .marker = if (is_last and is_vcl) 1 else 0,
             .payload_type = .h264,
             .sequence_number = self.sequence_number,
             .timestamp = self.timestamp,
@@ -235,6 +153,18 @@ pub const Packetizer = struct { // need to find a better name this sucks
         return packet;
     }
 };
+
+fn isVclNal(kind: h264.Nal.Header.Kind) bool {
+    return switch (kind) {
+        .slice_non_idr,
+        .slice_data_partition_a,
+        .slice_data_partition_b,
+        .slice_data_partition_c,
+        .slice_idr,
+        => true,
+        else => false,
+    };
+}
 
 pub const RtpHeader = packed struct(u96) {
     version: u2 = 2,
