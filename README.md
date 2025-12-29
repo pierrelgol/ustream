@@ -4,6 +4,8 @@ Toy experiment for streaming H.264 over RTP/UDP on localhost. This is not a
 production-ready implementation; it is meant for learning, iteration, and
 testing.
 
+![Demo](demo.png)
+
 ## Quick Start
 - Build: `zig build`
 - Run sender: `zig build run -- input.h264 30`
