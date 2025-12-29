@@ -29,6 +29,25 @@ pub const Server = struct {
         });
         log.debug("[Stage 4: Server] UDP socket bound to ephemeral port", .{});
 
+        const desired_send_buf: c_int = 4 * 1024 * 1024;
+        try std.posix.setsockopt(
+            socket.handle,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.SNDBUF,
+            &mem.toBytes(desired_send_buf),
+        );
+        var actual_send_buf: c_int = 0;
+        try std.posix.getsockopt(
+            socket.handle,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.SNDBUF,
+            std.mem.asBytes(&actual_send_buf),
+        );
+        log.debug(
+            "[Stage 4: Server] UDP send buffer requested {d}, effective {d} bytes",
+            .{ desired_send_buf, actual_send_buf },
+        );
+
         // Open separate file descriptor for reading NAL data
         const cwd = Io.Dir.cwd();
         const file = try cwd.openFile(io, file_path, .{ .mode = .read_only });
