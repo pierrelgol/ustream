@@ -149,7 +149,6 @@ pub const Server = struct {
                 @memcpy(udp_buffer[offset .. offset + nal_data.len], nal_data);
                 offset += nal_data.len;
                 if (nal_data.len > 0) nal_type_byte = nal_data[0];
-
             },
             .fua => |fua| {
                 // Serialize FU-A header (2 bytes) manually to avoid padding issues
@@ -191,24 +190,20 @@ pub const Server = struct {
     fn printPacketInfo(self: *Server, packet: Packetizer.RtpPacket, nal_type_byte: u8, total_size: usize) void {
         _ = self;
 
-        const stdout = std.fs.File.stdout();
-        var buf: [256]u8 = undefined;
-
         switch (packet.payload) {
             .single_nal => |nal| {
                 const nal_kind = nal_type_byte & 0x1F; // Lower 5 bits
-                const msg = std.fmt.bufPrint(&buf, "RTP: seq={d:5} ts={d:10} M={d} PT={d:3} SINGLE NAL(type={d:2}) size={d:5}\n", .{
+                log.info("RTP: seq={d:5} ts={d:10} M={d} PT={d:3} SINGLE NAL(type={d:2}) size={d:5}", .{
                     packet.header.sequence_number,
                     packet.header.timestamp,
                     packet.header.marker,
                     @intFromEnum(packet.header.payload_type),
                     nal_kind,
                     nal.nal_len,
-                }) catch return;
-                _ = stdout.write(msg) catch {};
+                });
             },
             .fua => |fua| {
-                const msg = std.fmt.bufPrint(&buf, "RTP: seq={d:5} ts={d:10} M={d} PT={d:3} FU-A(type={d:2} S={d} E={d}) size={d:5}\n", .{
+                log.info("RTP: seq={d:5} ts={d:10} M={d} PT={d:3} FU-A(type={d:2} S={d} E={d}) size={d:5}", .{
                     packet.header.sequence_number,
                     packet.header.timestamp,
                     packet.header.marker,
@@ -217,8 +212,7 @@ pub const Server = struct {
                     fua.header.start,
                     fua.header.end,
                     total_size,
-                }) catch return;
-                _ = stdout.write(msg) catch {};
+                });
             },
         }
     }
@@ -285,6 +279,8 @@ fn startCodeLen(data: []const u8, index: usize) ?usize {
 }
 
 pub fn generateSdpFile(
+    gpa: mem.Allocator,
+    io: Io,
     file_path: []const u8,
     host: []const u8,
     port: u16,
@@ -297,10 +293,10 @@ pub fn generateSdpFile(
     if (sps_pps) |params| {
         const sps_b64_len = std.base64.standard.Encoder.calcSize(params.sps.len);
         const pps_b64_len = std.base64.standard.Encoder.calcSize(params.pps.len);
-        const sps_b64 = try std.heap.page_allocator.alloc(u8, sps_b64_len);
-        defer std.heap.page_allocator.free(sps_b64);
-        const pps_b64 = try std.heap.page_allocator.alloc(u8, pps_b64_len);
-        defer std.heap.page_allocator.free(pps_b64);
+        const sps_b64 = try gpa.alloc(u8, sps_b64_len);
+        defer gpa.free(sps_b64);
+        const pps_b64 = try gpa.alloc(u8, pps_b64_len);
+        defer gpa.free(pps_b64);
 
         const sps_slice = std.base64.standard.Encoder.encode(sps_b64, params.sps);
         const pps_slice = std.base64.standard.Encoder.encode(pps_b64, params.pps);
@@ -312,7 +308,7 @@ pub fn generateSdpFile(
     }
 
     const sdp_content = try std.fmt.allocPrint(
-        std.heap.page_allocator,
+        gpa,
         "v=0\n" ++
             "o=- 0 0 IN IP4 {s}\n" ++
             "s=H264 RTP stream\n" ++
@@ -321,13 +317,18 @@ pub fn generateSdpFile(
             "m=video {d} RTP/AVP 96\n" ++
             "a=rtpmap:96 H264/90000\n" ++
             "{s}\n",
-        .{ host, host, port, fmtp_line },
+        .{
+            host,
+            host,
+            port,
+            fmtp_line,
+        },
     );
-    defer std.heap.page_allocator.free(sdp_content);
+    defer gpa.free(sdp_content);
 
-    const file = try std.fs.cwd().createFile(file_path, .{});
-    defer file.close();
-    try file.writeAll(sdp_content);
+    const file = try Io.Dir.cwd().createFile(io, file_path, .{});
+    defer file.close(io);
+    try file.writePositionalAll(io, sdp_content, 0);
 
     log.debug("[Pipeline] SDP file generated successfully", .{});
 }

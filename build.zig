@@ -23,6 +23,33 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
     });
 
+    const convert = b.step("convert", "convert input.mp4 into Annex-B h264");
+
+    const convert_command = b.addSystemCommand(&.{
+        "ffmpeg",
+        "-i",
+        "./input.mp4",
+        "-map",
+        "0:v:0",
+        "-c:v",
+        "copy",
+        "-bsf:v",
+        "h264_mp4toannexb",
+        "input.h264",
+    });
+    convert.dependOn(&convert_command.step);
+
+    const play = b.step("play", "Run ffplay, to see the output of the server");
+
+    const play_command = b.addSystemCommand(&.{
+        "ffplay",
+        "-protocol_whitelist",
+        "file,udp,rtp",
+        "session.sdp",
+    });
+
+    play.dependOn(&play_command.step);
+
     const run_step = b.step("run", "Run the app");
 
     const run_cmd = b.addRunArtifact(exe);

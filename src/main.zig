@@ -9,10 +9,6 @@ const time = std.time;
 const Packetizer = @import("Packetizer.zig");
 const Server = @import("server.zig");
 
-var stdout_buffer: [4096]u8 = undefined;
-var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-const stdout = &stdout_writer.interface;
-
 fn produceNal(io: Io, parser: *h264.Parser, queue: *Io.Queue(h264.Nal)) !void {
     log.debug("[Stage 1: Producer] Started NAL production", .{});
     var count: usize = 0;
@@ -29,8 +25,7 @@ fn produceNal(io: Io, parser: *h264.Parser, queue: *Io.Queue(h264.Nal)) !void {
     log.debug("[Stage 1: Producer] Closing NAL queue (consumers can still drain remaining items)", .{});
     queue.close(io);
 
-    try stdout.print("Total Nal packets produced: {}\n", .{count});
-    try stdout.flush();
+    log.info("Total Nal packets produced: {}", .{count});
     log.debug("[Stage 1: Producer] Exited", .{});
 }
 
@@ -43,7 +38,6 @@ fn consumeNalProducePacket(io: Io, packetizer: *Packetizer.Packetizer, queue: *I
         try queue.putOne(io, packet);
         packet_count += 1;
 
-        // Track NAL boundaries (marker bit indicates last fragment of a NAL)
         if (packet.header.marker == 1) {
             nal_count += 1;
             if (nal_count % 100 == 0) {
@@ -57,24 +51,20 @@ fn consumeNalProducePacket(io: Io, packetizer: *Packetizer.Packetizer, queue: *I
     log.debug("[Stage 2: Packetizer] Closing RTP packet queue (consumer can still drain remaining items)", .{});
     queue.close(io);
 
-    try stdout.print("Total RTP packets produced: {}\n", .{packet_count});
-    try stdout.flush();
+    log.info("Total RTP packets produced: {}", .{packet_count});
     log.debug("[Stage 2: Packetizer] Exited", .{});
 }
 
-// Removed consumePacket - replaced with UDP Server (see server.zig)
-
 pub fn main() !void {
-    var gpa: heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
+    const gpa = heap.smp_allocator;
 
-    var threaded: Io.Threaded = .init(gpa.allocator());
+    var threaded: Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
 
-    const argv: [][:0]u8 = process.argsAlloc(gpa.allocator()) catch |err| {
+    const argv: [][:0]u8 = process.argsAlloc(gpa) catch |err| {
         return log.err("Fatal : {}", .{err});
     };
-    defer process.argsFree(gpa.allocator(), argv);
+    defer process.argsFree(gpa, argv);
 
     if (argv.len < 2) {
         return log.err("Usage: {s} <input.h264> [fps]", .{argv[0]});
@@ -112,9 +102,8 @@ pub fn main() !void {
 
     var pak_buffer: [1024]Packetizer.RtpPacket = undefined;
     var pak_queue: Io.Queue(Packetizer.RtpPacket) = .init(&pak_buffer);
-    var packetizer = Packetizer.Packetizer.init(&nal_queue, 421412, 1000, timestamp_step);
+    var packetizer = Packetizer.Packetizer.init(&nal_queue, 421412, 1500, timestamp_step);
 
-    // Initialize UDP RTP Server
     var server_file_buffer: [256 * 1024]u8 = undefined;
     const dest_host = "127.0.0.1";
     const dest_port: u16 = 5004;
@@ -129,15 +118,22 @@ pub fn main() !void {
     );
     defer server.deinit(threaded.io());
 
-    // Generate SDP file for VLC
-    const sdp_data = try std.fs.cwd().readFileAlloc(
+    const sdp_data = try Io.Dir.cwd().readFileAlloc(
+        threaded.io(),
         argv[1],
-        gpa.allocator(),
+        gpa,
         std.Io.Limit.limited(64 * 1024 * 1024),
     );
-    defer gpa.allocator().free(sdp_data);
+    defer gpa.free(sdp_data);
     const sps_pps = Server.findSpsPps(sdp_data);
-    try Server.generateSdpFile("session.sdp", dest_host, dest_port, sps_pps);
+    try Server.generateSdpFile(
+        gpa,
+        threaded.io(),
+        "session.sdp",
+        dest_host,
+        dest_port,
+        sps_pps,
+    );
 
     log.debug("[Pipeline] Launching 4-stage concurrent pipeline", .{});
     log.debug("[Pipeline] - Stage 1: NAL Producer (H.264 parser)", .{});
@@ -157,7 +153,6 @@ pub fn main() !void {
 
     log.debug("[Pipeline] All stages started, waiting for completion...", .{});
 
-    // Wait for all tasks to complete
     f1.await(threaded.io()) catch |err| switch (err) {
         error.Closed, error.Canceled => {},
         else => return err,
@@ -177,6 +172,5 @@ pub fn main() !void {
     const elapsed_ms = elapsed_ns / time.ns_per_ms;
 
     log.debug("[Pipeline] All stages completed successfully in {d}ms", .{elapsed_ms});
-    try stdout.print("\nProcessing completed in {}ms\n", .{elapsed_ms});
-    try stdout.flush();
+    log.info("\nProcessing completed in {}ms\n", .{elapsed_ms});
 }
