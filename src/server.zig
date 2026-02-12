@@ -4,6 +4,14 @@ const Packetizer = @import("Packetizer.zig");
 const net = std.Io.net;
 const log = std.log;
 const mem = std.mem;
+const time = std.time;
+
+fn getMonotonicTime() !u64 {
+    var ts: std.os.linux.timespec = undefined;
+    const rc = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts);
+    if (rc != 0) return error.ClockError;
+    return @as(u64, @intCast(ts.sec)) * time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
 
 pub const Server = struct {
     socket: net.Socket,
@@ -36,16 +44,9 @@ pub const Server = struct {
             std.posix.SO.SNDBUF,
             &mem.toBytes(desired_send_buf),
         );
-        var actual_send_buf: c_int = 0;
-        try std.posix.getsockopt(
-            socket.handle,
-            std.posix.SOL.SOCKET,
-            std.posix.SO.SNDBUF,
-            std.mem.asBytes(&actual_send_buf),
-        );
         log.debug(
-            "[Stage 4: Server] UDP send buffer requested {d}, effective {d} bytes",
-            .{ desired_send_buf, actual_send_buf },
+            "[Stage 4: Server] UDP send buffer set to {d} bytes",
+            .{desired_send_buf},
         );
 
         // Open separate file descriptor for reading NAL data
@@ -66,7 +67,7 @@ pub const Server = struct {
         log.debug("[Stage 4: Server] Started UDP streaming to {any}", .{self.dest_addr});
         var count: usize = 0;
         var previous_timestamp: ?u32 = null;
-        var start_time = try std.time.Instant.now();
+        var start_time = try getMonotonicTime();
 
         while (true) {
             const packet = self.packet_queue.getOne(io) catch |err| switch (err) {
@@ -87,8 +88,8 @@ pub const Server = struct {
                     const delay_ns: u64 = (@as(u64, ts_delta) * 1_000_000_000) / 90000;
 
                     // Calculate target time for this packet
-                    const current_time = try std.time.Instant.now();
-                    const elapsed_ns = current_time.since(start_time);
+                    const current_time = try getMonotonicTime();
+                    const elapsed_ns = current_time - start_time;
 
                     // Sleep if we're ahead of schedule
                     if (delay_ns > elapsed_ns) {
@@ -96,7 +97,7 @@ pub const Server = struct {
                         try io.sleep(Io.Duration.fromNanoseconds(sleep_ns), .awake);
                     }
 
-                    start_time = try std.time.Instant.now();
+                    start_time = try getMonotonicTime();
                 }
             }
 

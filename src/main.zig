@@ -6,8 +6,16 @@ const process = std.process;
 const Io = std.Io;
 const h264 = @import("h264.zig");
 const time = std.time;
+const posix = std.posix;
 const Packetizer = @import("Packetizer.zig");
 const Server = @import("server.zig");
+
+fn getMonotonicTime() !u64 {
+    var ts: std.os.linux.timespec = undefined;
+    const rc = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts);
+    if (rc != 0) return error.ClockError;
+    return @as(u64, @intCast(ts.sec)) * time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
 
 fn produceNal(io: Io, parser: *h264.Parser, queue: *Io.Queue(h264.Nal)) !void {
     log.debug("[Stage 1: Producer] Started NAL production", .{});
@@ -55,24 +63,20 @@ fn consumeNalProducePacket(io: Io, packetizer: *Packetizer.Packetizer, queue: *I
     log.debug("[Stage 2: Packetizer] Exited", .{});
 }
 
-pub fn main() !void {
-    const gpa = heap.smp_allocator;
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+    const io = init.io;
+    const arena = init.arena.allocator();
 
-    var threaded: Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
+    const args = try init.minimal.args.toSlice(arena);
 
-    const argv: [][:0]u8 = process.argsAlloc(gpa) catch |err| {
-        return log.err("Fatal : {}", .{err});
-    };
-    defer process.argsFree(gpa, argv);
-
-    if (argv.len < 2) {
-        return log.err("Usage: {s} <input.h264> [fps]", .{argv[0]});
+    if (args.len < 2) {
+        return log.err("Usage: {s} <input.h264> [fps]", .{args[0]});
     }
 
-    const fps: u32 = if (argv.len > 2)
-        std.fmt.parseInt(u32, argv[2], 10) catch |err| {
-            return log.err("Fatal: invalid fps '{s}': {s}", .{ argv[2], @errorName(err) });
+    const fps: u32 = if (args.len > 2)
+        std.fmt.parseInt(u32, args[2], 10) catch |err| {
+            return log.err("Fatal: invalid fps '{s}': {s}", .{ args[2], @errorName(err) });
         }
     else
         30;
@@ -85,20 +89,20 @@ pub fn main() !void {
     }
 
     const cwd = std.Io.Dir.cwd();
-    const file = cwd.openFile(threaded.io(), argv[1], .{ .mode = .read_only }) catch |err| {
+    const file = cwd.openFile(io, args[1], .{ .mode = .read_only }) catch |err| {
         return log.err("Fatal : {}", .{err});
     };
-    defer file.close(threaded.io());
+    defer file.close(io);
 
     var file_buffer: [256 * 1024]u8 = undefined;
-    var file_reader = file.reader(threaded.io(), &file_buffer);
+    var file_reader = file.reader(io, &file_buffer);
     const reader = &file_reader.interface;
 
     var parser = h264.Parser.init(reader);
     var nal_buffer: [1024]h264.Nal = undefined;
     var nal_queue: Io.Queue(h264.Nal) = .init(&nal_buffer);
 
-    var timer = try time.Timer.start();
+    const start_time = try getMonotonicTime();
 
     var pak_buffer: [1024]Packetizer.RtpPacket = undefined;
     var pak_queue: Io.Queue(Packetizer.RtpPacket) = .init(&pak_buffer);
@@ -110,17 +114,17 @@ pub fn main() !void {
     const dest_addr = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:5004");
 
     var server = try Server.Server.init(
-        threaded.io(),
+        io,
         dest_addr,
         &pak_queue,
-        argv[1],
+        args[1],
         &server_file_buffer,
     );
-    defer server.deinit(threaded.io());
+    defer server.deinit(io);
 
     const sdp_data = try Io.Dir.cwd().readFileAlloc(
-        threaded.io(),
-        argv[1],
+        io,
+        args[1],
         gpa,
         std.Io.Limit.limited(64 * 1024 * 1024),
     );
@@ -128,7 +132,7 @@ pub fn main() !void {
     const sps_pps = Server.findSpsPps(sdp_data);
     try Server.generateSdpFile(
         gpa,
-        threaded.io(),
+        io,
         "session.sdp",
         dest_host,
         dest_port,
@@ -142,33 +146,34 @@ pub fn main() !void {
     log.debug("[Pipeline] - Stage 4: UDP RTP Server (stream to VLC)", .{});
     log.debug("[Pipeline] Target: {any}", .{dest_addr});
 
-    var f1 = try threaded.io().concurrent(produceNal, .{ threaded.io(), &parser, &nal_queue });
-    errdefer f1.cancel(threaded.io()) catch {};
+    var f1 = try io.concurrent(produceNal, .{ io, &parser, &nal_queue });
+    errdefer f1.cancel(io) catch {};
 
-    var f2 = try threaded.io().concurrent(consumeNalProducePacket, .{ threaded.io(), &packetizer, &pak_queue });
-    errdefer f2.cancel(threaded.io()) catch {};
+    var f2 = try io.concurrent(consumeNalProducePacket, .{ io, &packetizer, &pak_queue });
+    errdefer f2.cancel(io) catch {};
 
-    var f4 = try threaded.io().concurrent(Server.Server.run, .{ &server, threaded.io() });
-    errdefer f4.cancel(threaded.io()) catch {};
+    var f4 = try io.concurrent(Server.Server.run, .{ &server, io });
+    errdefer f4.cancel(io) catch {};
 
     log.debug("[Pipeline] All stages started, waiting for completion...", .{});
 
-    f1.await(threaded.io()) catch |err| switch (err) {
+    f1.await(io) catch |err| switch (err) {
         error.Closed, error.Canceled => {},
-        else => return err,
+        else => |e| return e,
     };
     log.debug("[Pipeline] Stage 1 (Producer) completed", .{});
 
-    f2.await(threaded.io()) catch |err| switch (err) {
+    f2.await(io) catch |err| switch (err) {
         error.Closed, error.Canceled => {},
-        else => return err,
+        else => |e| return e,
     };
     log.debug("[Pipeline] Stage 2 (Packetizer) completed", .{});
 
-    try f4.await(threaded.io());
+    try f4.await(io);
     log.debug("[Pipeline] Stage 4 (UDP Server) completed", .{});
 
-    const elapsed_ns = timer.lap();
+    const end_time = try getMonotonicTime();
+    const elapsed_ns = end_time - start_time;
     const elapsed_ms = elapsed_ns / time.ns_per_ms;
 
     log.debug("[Pipeline] All stages completed successfully in {d}ms", .{elapsed_ms});
